@@ -1,88 +1,42 @@
 # main.py — 가스 공급량 예측 FastAPI 서버
-# 실행: VS Code 실행 버튼(▶) 또는  python main.py
+# 실행: VS Code 실행 버튼(▶) 또는  python main.py     (프로젝트 폴더에서 실행)
+#
+# ※ 모델 학습은 train.py 에서 함. 이 파일은 저장된 모델을 불러와서 쓰기만 함
+#   처음 실행하거나 모델을 바꿨을 때:  python train.py  →  python main.py
 import math
+import os
+import joblib
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_percentage_error
+from prepare import load_data, TARGET
 
 app = FastAPI()
 
-TRAIN_COL = ['월평균기온', '전월기온', '총인구수']   # 예측 모델 입력 (학습·예측 모두 같은 컬럼)
-SIM_COL = ['난방도일', '전월난방도일']                # 시뮬레이션 모델 입력
-TARGET = '공급량(㎥)'                    # 모델이 맞히는 값
+MODEL_PATH = 'model/gas_models.pkl'   # train.py 가 저장하는 파일
 
 # ---------------------------------------------------------------
-# 서버가 켜질 때 한 번만 실행: 데이터 읽기 → 지역별 모델 학습
+# 서버가 켜질 때 한 번만 실행: 데이터 읽기 → 저장된 모델 불러오기
 # ---------------------------------------------------------------
-df = pd.read_csv('가스_인구_기온_통합.csv', encoding='cp949')
-df[TARGET] = df[TARGET] / 1000     # /api/regions 와 같은 단위로 맞춤
-df = df.sort_values(['시도', '연월'])
-df['월'] = df['연월'].str[5:].astype(int)        # '2021-01' → 1
+# 데이터: 최근 실적 12개월, 가장 최근 인구, 월별 평년 기온을 꺼낼 때 사용
+df = load_data()   # prepare.py
 
-# ---------------------------------------------------------------
-# [기록] 2026-10-07  '전월기온'(지난달 기온)을 입력에 추가한 이유
-# ---------------------------------------------------------------
-# 문제: 대구의 예측 오차(MAPE)가 60% 를 넘었음 (다른 지역은 대부분 10~20%)
-# 원인: 대구·경남은 공급량이 기온보다 "한 달 늦게" 움직임
-#   - 공급량이 가장 많은 달: 대구·경남 2월 / 나머지 지역 1월   (가장 추운 달은 1월)
-#   - 공급량이 가장 적은 달: 대구·경남 9월 / 나머지 지역 8월
-#   - 대구는 같은 10°C 인데 3월 공급량이 11월의 3.3배 (다른 지역은 1.3~1.5배)
-#   - 공급량과의 상관: 대구는 당월 기온 -0.83, 전월 기온 -0.96  ↔  서울은 당월 -0.96, 전월 -0.91
-#   → "이번 달 기온"만 넣으면 모델이 봄과 가을을 구분하지 못해 크게 틀림
-#   (늦게 움직이는 이유는 데이터만으로는 확정 못 함. 검침·청구 기준 집계일 가능성 → 원본 출처 확인 필요)
-# 해결: 이번 달 기온과 지난달 기온을 둘 다 입력으로 넣음 → 지역마다 더 잘 맞는 쪽을 모델이 알아서 사용
-# 결과 (최근 12개월을 맞혀 본 MAPE, RandomForest):
-#   대구 62.5% → 7.3%,  경남 23.5% → 5.7%,  강원 24.4% → 9.9%,  18개 지역 평균 16.7% → 8.4%
-#   시뮬레이션용 선형 모델의 설명력(R²)도 평균 0.93 → 0.98 (대구 0.66 → 0.99)
-# ---------------------------------------------------------------
-# 지역별로 한 칸씩 아래로 밀어서 "지난달 기온" 컬럼을 만듦 (각 지역의 첫 달 2021-01 은 지난달이 없어 비어 있음)
-df['전월기온'] = df.groupby('시도')['월평균기온'].shift(1)
+# 모델 파일이 없으면 무엇을 해야 하는지 알려주고 끝냄
+if not os.path.exists(MODEL_PATH):
+    raise SystemExit('모델 파일(' + MODEL_PATH + ')이 없습니다. 먼저  python train.py  를 실행하세요.')
 
-# 시뮬레이션 모델용 컬럼
-#   1인당 공급량 = 공급량 ÷ 인구            → 마지막에 인구를 곱하면 인구 변화가 그대로 반영됨
-#   난방도일     = 18°C 보다 얼마나 추운지   → 18°C 이상이면 0 (난방 필요 없음)
-df['1인당'] = df[TARGET] / df['총인구수']
-df['난방도일'] = (18 - df['월평균기온']).clip(lower=0)
-df['전월난방도일'] = (18 - df['전월기온']).clip(lower=0)   # 지난달 난방도일 (첫 달은 비어 있음)
-
-models = {}       # 예측용 모델      {'서울': RandomForest, ...}
-mapes = {}        # 예측 오차율      {'서울': 0.19, ...}  (신뢰구간 계산용)
-recent_mapes = {} # 맞혀 본 12개월 중 최근 3개월의 오차율   ┐ 전국 페이지의
-before_mapes = {} # 그 앞 3개월의 오차율                    ┘ 'MAPE 전분기 대비' 계산용
-weights = {}      # 지역별 비중 (맞혀 본 12개월의 공급량 합) → 전국 평균을 낼 때 큰 지역에 비중을 더 줌
-sim_models = {}   # 시뮬레이션용 모델 {'서울': LinearRegression, ...}
-
-for region in df['시도'].unique():
-    # 지난달 기온이 없는 첫 달(2021-01)은 학습에서 제외
-    sub = df[df['시도'] == region].dropna(subset=['전월기온'])
-
-    # 1) 오차율 구하기: 최근 12개월을 빼고 학습한 뒤, 그 12개월을 맞혀 봄
-    train_df, test_df = sub.iloc[:-12], sub.iloc[-12:]
-    test_model = RandomForestRegressor(n_estimators=100, random_state=42)
-    test_model.fit(train_df[TRAIN_COL], train_df[TARGET])
-    test_pred = test_model.predict(test_df[TRAIN_COL])
-    mapes[region] = mean_absolute_percentage_error(test_df[TARGET], test_pred)
-
-    #    같은 12개월을 최근 3개월([-3:])과 그 앞 3개월([-6:-3])로 나눠 오차율을 따로 구해 둠
-    recent_mapes[region] = mean_absolute_percentage_error(test_df[TARGET].iloc[-3:], test_pred[-3:])
-    before_mapes[region] = mean_absolute_percentage_error(test_df[TARGET].iloc[-6:-3], test_pred[-6:-3])
-    weights[region] = float(test_df[TARGET].sum())
-
-    # 2) 예측에 쓸 모델: 전체 데이터로 학습
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(sub[TRAIN_COL], sub[TARGET])
-    models[region] = model
-
-    # 3) 시뮬레이션에 쓸 모델: 이번 달·지난달 난방도일 → 1인당 공급량 (직선 관계)
-    #    RandomForest 는 학습 때 본 기온(약 -5~29°C) 밖에서는 값이 변하지 않아서
-    #    슬라이더로 -15°C 를 넣어도 -5°C 와 똑같이 나옴 → 범위 밖에서도 반응하는 선형회귀 사용
-    sim_model = LinearRegression()
-    sim_model.fit(sub[SIM_COL], sub['1인당'])
-    sim_models[region] = sim_model
+# train.py 가 저장한 묶음(딕셔너리)을 불러와서, 예전과 같은 이름의 변수에 담음
+#   → 변수 이름이 같아서 아래 API 코드는 바꿀 필요가 없음
+saved = joblib.load(MODEL_PATH)
+models = saved['models']               # 예측용 모델      {'서울': RandomForest, ...}
+sim_models = saved['sim_models']       # 시뮬레이션용 모델 {'서울': LinearRegression, ...}
+mapes = saved['mapes']                 # 예측 오차율      {'서울': 0.085, ...}  (신뢰구간 계산용)
+recent_mapes = saved['recent_mapes']   # 최근 3개월의 오차율   ┐ 전국 페이지의
+before_mapes = saved['before_mapes']   # 그 앞 3개월의 오차율  ┘ 'MAPE 전분기 대비' 계산용
+weights = saved['weights']             # 지역별 비중 → 전국 평균을 낼 때 큰 지역에 비중을 더 줌
+TRAIN_COL = saved['TRAIN_COL']         # 예측 모델 입력 컬럼 (학습할 때 쓴 것 그대로)
+SIM_COL = saved['SIM_COL']             # 시뮬레이션 모델 입력 컬럼
 
 
 # '2026-06' 다음 달부터 n개의 연월 만들기 → ['2026-07', '2026-08', ...]
@@ -134,7 +88,8 @@ def forecast(region: str, horizon: int = 6):
     for i, ym in enumerate(next_months(last_ym, horizon)):
         month = int(ym[5:])
         temp = float(normal_temp[month])
-        X_future = pd.DataFrame({'월평균기온': [temp], '전월기온': [prev_temp], '총인구수': [last_pop]})
+        # 입력 컬럼은 train.py 의 TRAIN_COL 과 같아야 함 (이름·순서 모두)
+        X_future = pd.DataFrame({'월평균기온': [temp], '전월기온': [prev_temp], '총인구수': [last_pop], '월': [month]})
         value = float(model.predict(X_future)[0])
         prev_temp = temp    # 다음 달 입장에서는 이번 달 기온이 '지난달 기온'
 
@@ -183,7 +138,7 @@ def national_mape(mape_by_region):
 # ---------------------------------------------------------------
 # GET /mape
 #   items : 지역별 예측 오차율(MAPE, %) — 지역 이름 옆 MAPE 배지, 전국 페이지 정확도 차트에 쓰임
-#           서버가 켜질 때 계산해 둔 mapes(0.19 같은 비율)를 % 로 바꿔서 돌려줌 (0.19 → 19.0)
+#           train.py 가 계산해서 저장해 둔 mapes(0.19 같은 비율)를 % 로 바꿔서 돌려줌 (0.19 → 19.0)
 #   delta : 전국 MAPE 의 전분기 대비 변화(%p) = 최근 3개월 전국 MAPE - 그 앞 3개월 전국 MAPE
 #           음수면 최근 분기에 오차가 줄었다는 뜻
 # ---------------------------------------------------------------
