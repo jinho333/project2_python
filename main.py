@@ -198,7 +198,7 @@ def mape_list():
         items.append({
             'region': region,
             'mape': round(mapes[region] * 100, 1),
-            'sensitivity': sens,
+            'sensitivity': sens, #기온 민감도
         })
 
     delta = (national_mape(recent_mapes) - national_mape(before_mapes)) * 100
