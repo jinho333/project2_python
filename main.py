@@ -191,7 +191,15 @@ def national_mape(mape_by_region):
 def mape_list():
     items = []
     for region in mapes:
-        items.append({'region': region, 'mape': round(mapes[region] * 100, 1)})
+        sub = df[df['시도'] == region].dropna(subset=['전월기온'])
+        coef_sum = sim_models[region].coef_.sum()
+        mean_per_person = sub['1인당'].mean()                   # ← 지역별 분모
+        sens = round(coef_sum / mean_per_person * 100, 1)
+        items.append({
+            'region': region,
+            'mape': round(mapes[region] * 100, 1),
+            'sensitivity': sens,
+        })
 
     delta = (national_mape(recent_mapes) - national_mape(before_mapes)) * 100
 
