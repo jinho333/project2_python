@@ -58,10 +58,27 @@ def next_months(last_ym, n):
 #   horizon : 예측할 개월 수 (3 또는 6)
 # 응답 모양은 화면(forecast.js)이 쓰는 그대로 { hist: [...], fut: [...] }
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# [기록] 2026-10-08  예측 결과를 기억해 두기 (캐시)
+#   문제: 공급 예측 페이지를 열 때 지도 색칠용 /forecast/summary 가 약 0.5초 걸려 화면이 버벅거림
+#         (17개 지역 × 6개월 = 약 100번 모델 예측을 요청이 올 때마다 다시 함)
+#   원인: 모델·데이터·평년 기온은 서버가 켜져 있는 동안 바뀌지 않음 → 결과도 매번 똑같은데 매번 다시 계산
+#   해결: 한 번 계산한 결과를 forecast_cache 에 넣어 두고, 같은 (지역, 개월 수) 요청이 오면 바로 돌려줌
+#         + 서버가 켜질 때 3개월·6개월을 미리 계산해 둠 (맨 아래 참고) → 첫 방문부터 빠름
+#   ※ train.py 로 모델을 다시 학습하면 서버를 재시작해야 캐시도 새로 만들어짐
+# ---------------------------------------------------------------
+forecast_cache = {}   # {('서울', 6): {'hist': [...], 'fut': [...]}, ...}
+
+
 @app.get('/forecast')
 def forecast(region: str, horizon: int = 6):
     if region not in models:
         raise HTTPException(status_code=404, detail=f'{region} 지역이 없습니다')
+
+    # 이미 계산한 적이 있으면 저장해 둔 결과를 바로 돌려줌 (아래 계산을 건너뜀)
+    key = (region, horizon)
+    if key in forecast_cache:
+        return forecast_cache[key]
 
     sub = df[df['시도'] == region]
     model = models[region]
@@ -104,7 +121,9 @@ def forecast(region: str, horizon: int = 6):
             'hi': value * (1 + err)
         })
 
-    return {'hist': hist, 'fut': fut}
+    result = {'hist': hist, 'fut': fut}
+    forecast_cache[key] = result   # 다음에 같은 요청이 오면 바로 쓰도록 기억해 둠
+    return result
 
 
 # ---------------------------------------------------------------
@@ -220,6 +239,15 @@ def simulation(region: str, req: SimRequest):
     sim = year_profile(region, req.tempLo, req.tempHi, new_pop)
 
     return {'base': base, 'sim': sim}
+
+
+# ---------------------------------------------------------------
+# 서버가 켜질 때 화면이 쓰는 3개월·6개월 예측을 미리 계산해 캐시에 넣어 둠
+#   → 첫 사용자도 기다리지 않음 (서버가 켜지는 시간이 조금 늘어나는 대신)
+# ---------------------------------------------------------------
+for region in models:
+    for h in (3, 6):
+        forecast(region, h)
 
 
 # ---------------------------------------------------------------
