@@ -95,18 +95,32 @@ def forecast(region: str, horizon: int = 6):
 
     # fut: 앞으로 horizon 개월 예측
     normal_temp = sub.groupby('월')['월평균기온'].mean()   # 월별 평년 기온
-    last_pop = sub['총인구수'].iloc[-1]                    # 가장 최근 인구
+    last_pop = float(sub['총인구수'].iloc[-1])             # 가장 최근 인구
     last_ym = sub['연월'].iloc[-1]                         # 데이터의 마지막 달
 
     # 지난달 기온: 첫 예측 달은 데이터의 마지막 달 실제 기온, 그 다음부터는 바로 앞 달의 평년 기온
     prev_temp = float(sub['월평균기온'].iloc[-1])
 
+    # 월별 인구 증감률 계산 (과거 추세를 미래에 적용)
+    # : 최근 12개월 평균 / 그 이전 12개월 평균 → 연간 증감률
+    #   예) 1.012 - 1 = 0.012 (연 +1.2%) → 월 환산 = 0.012 / 12
+    pop_series = sub['총인구수'].astype(float).values
+    if len(pop_series) >= 24:
+        recent12 = pop_series[-12:].mean()
+        prior12  = pop_series[-24:-12].mean()
+        yearly_growth = (recent12 / prior12 - 1) if prior12 > 0 else 0.0
+    else:
+        yearly_growth = 0.0
+    monthly_growth = yearly_growth / 12.0   # 월 증감률
+
     fut = []
     for i, ym in enumerate(next_months(last_ym, horizon)):
         month = int(ym[5:])
         temp = float(normal_temp[month])
+        # 매월 인구 증가 반영: 최근 인구 × (1 + 월증감률)^(지난 개월수)
+        projected_pop = last_pop * ((1 + monthly_growth) ** (i + 1))
         # 입력 컬럼은 train.py 의 TRAIN_COL 과 같아야 함 (이름·순서 모두)
-        X_future = pd.DataFrame({'월평균기온': [temp], '전월기온': [prev_temp], '총인구수': [last_pop], '월': [month]})
+        X_future = pd.DataFrame({'월평균기온': [temp], '전월기온': [prev_temp], '총인구수': [projected_pop], '월': [month]})
         value = float(model.predict(X_future)[0])
         prev_temp = temp    # 다음 달 입장에서는 이번 달 기온이 '지난달 기온'
 
@@ -121,7 +135,17 @@ def forecast(region: str, horizon: int = 6):
             'hi': value * (1 + err)
         })
 
-    result = {'hist': hist, 'fut': fut}
+    # trend     : 연 증감률 (참고용, horizon 무관)
+    # cumTrend  : horizon 개월 뒤 예상 인구가 "가장 최근 달 인구" 대비 몇 % 변했는지
+    #             = (1 + monthly_growth)^horizon - 1  (복리)
+    #             → horizon(3/6)에 따라 다른 값이 나와 화면에서 변화가 보임
+    cum_growth = ((1 + monthly_growth) ** horizon - 1) * 100
+    result = {
+        'hist': hist,
+        'fut': fut,
+        'trend': round(yearly_growth * 100, 2),
+        'cumTrend': round(cum_growth, 2)
+    }
     forecast_cache[key] = result   # 다음에 같은 요청이 오면 바로 쓰도록 기억해 둠
     return result
 
